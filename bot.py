@@ -16,7 +16,7 @@ from telegram.constants import ParseMode, ChatAction
 from telegram.error import TelegramError, RetryAfter, Forbidden
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatJoinRequestHandler, ChatMemberHandler
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8991200624:AAHRyMR9Xa8JWPcEh7VvwRm9hoJUzRF3y7E").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 try: ADMIN_ID = int(os.getenv("ADMIN_ID", "8565258976").strip())
 except ValueError: ADMIN_ID = 0
 try: OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_ID)).strip())
