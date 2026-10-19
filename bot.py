@@ -16,11 +16,13 @@ from telegram.constants import ParseMode, ChatAction
 from telegram.error import TelegramError, RetryAfter, Forbidden
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatJoinRequestHandler, ChatMemberHandler
 
+# Secrets must come from the hosting provider's Environment Variables only.
+# Never place a real Telegram bot token in source code, GitHub, backups, or logs.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-try: ADMIN_ID = int(os.getenv("ADMIN_ID", "8565258976").strip())
-except ValueError: ADMIN_ID = 0
+try: ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip())
+except (TypeError, ValueError): ADMIN_ID = 0
 try: OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_ID)).strip())
-except ValueError: OWNER_ID = ADMIN_ID
+except (TypeError, ValueError): OWNER_ID = ADMIN_ID
 DB_PATH = os.getenv("DB_PATH", "bot2.db").strip() or "bot2.db"
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "backups")); BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 BOT_VERSION, DB_VERSION = "4.4.0", 8
@@ -42,6 +44,38 @@ EMOJI = {"🎯": "5228855127892327218", "📊": "6093382540784046658", "🤝": "
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("force_join_bot")
+
+class SecretRedactionFilter(logging.Filter):
+    """Redact the configured bot token from normal log messages and tracebacks."""
+    def filter(self, record):
+        secret = BOT_TOKEN
+        if not secret:
+            return True
+        try:
+            rendered = record.getMessage().replace(secret, "[REDACTED_BOT_TOKEN]")
+            record.msg = rendered
+            record.args = ()
+        except Exception:
+            record.msg = "[log message redacted due to formatting error]"
+            record.args = ()
+        if record.exc_info:
+            try:
+                import traceback
+                rendered_tb = "".join(traceback.format_exception(*record.exc_info))
+                record.exc_text = rendered_tb.replace(secret, "[REDACTED_BOT_TOKEN]")
+                record.exc_info = None
+            except Exception:
+                record.exc_info = None
+                record.exc_text = "[exception details omitted]"
+        elif record.exc_text:
+            record.exc_text = record.exc_text.replace(secret, "[REDACTED_BOT_TOKEN]")
+        return True
+
+_secret_filter = SecretRedactionFilter()
+logging.getLogger().addFilter(_secret_filter)
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_secret_filter)
+logger.addFilter(_secret_filter)
 
 # Conversation states
 (S_CH_ID,S_CH_NAME,S_CH_LINK,S_WELCOME,S_WELCOME_PHOTO,S_POSTJOIN,S_TOP,S_BTN1,S_BTN2,S_BTN3,
@@ -2298,8 +2332,8 @@ def release_instance_lock():
         INSTANCE_LOCK_FH = None
 
 def main():
-    if not BOT_TOKEN:raise RuntimeError("BOT_TOKEN is missing. Set BOT_TOKEN environment variable.")
-    if not ADMIN_ID:raise RuntimeError("ADMIN_ID is missing or invalid. Set ADMIN_ID environment variable.")
+    if not BOT_TOKEN:raise RuntimeError("BOT_TOKEN is missing. Add it in Render -> Environment as a secret environment variable.")
+    if not ADMIN_ID:raise RuntimeError("ADMIN_ID is missing or invalid. Set ADMIN_ID in Render -> Environment.")
     if not acquire_instance_lock():
         raise RuntimeError("A second bot polling process was detected on this service. Stop the duplicate process/service before starting this bot.")
     init_db()
