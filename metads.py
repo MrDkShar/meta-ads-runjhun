@@ -16,7 +16,7 @@ from telegram.constants import ParseMode, ChatAction
 from telegram.error import TelegramError, RetryAfter, Forbidden
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatJoinRequestHandler, ChatMemberHandler
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8991200624:AAFf7Bu3olCaHTTHG_BQD_kRy8e30HsbI2A").strip()
 try: ADMIN_ID = int(os.getenv("ADMIN_ID", "8565258976").strip())
 except ValueError: ADMIN_ID = 0
 try: OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_ID)).strip())
@@ -46,7 +46,7 @@ logger = logging.getLogger("force_join_bot")
 # Conversation states
 (S_CH_ID,S_CH_NAME,S_CH_LINK,S_WELCOME,S_WELCOME_PHOTO,S_POSTJOIN,S_TOP,S_BTN1,S_BTN2,S_BTN3,
  S_BCAST,S_RESTORE,S_SEARCH,S_USERMSG,S_EDITNAME,S_EDITLINK,S_EMOJI,S_BTN_NAME,S_BTN_NORMAL,S_BTN_PREMIUM,S_FORCE_JOIN_MSG,
- S_BCAST_BTN_ASK,S_BCAST_BTN_LINK,S_BCAST_BTN_NAME,S_BCAST_BTN_STYLE,S_BCAST_PREVIEW)=range(26)
+ S_BCAST_BTN_ASK,S_BCAST_BTN_LINK,S_BCAST_BTN_NAME,S_BCAST_BTN_STYLE,S_BCAST_PREVIEW,S_OWNERID)=range(27)
 
 @contextmanager
 def db():
@@ -228,6 +228,7 @@ def init_db():
           "join_channel_premium_emoji_id":EMOJI["📣"],
           "joined_button_label":"Joined",
           "joined_button_premium_emoji_id":EMOJI["✅"],
+          "owner_id":str(OWNER_ID or ""),
         }
         for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,str(v)))
         migrate_force_join_message_setting(c)
@@ -235,14 +236,27 @@ def init_db():
         migrate_button_configs(c)
         sanitize_database_values(c)
 
+def get_owner_id():
+    """Owner ID is editable from the admin panel (Settings -> Owner ID) and
+    lives in the DB so it survives without touching Render env vars. The
+    OWNER_ID env var is only used once, as the seed value on first boot."""
+    raw=str(gset("owner_id","") or "").strip()
+    if raw:
+        try: return int(raw)
+        except ValueError: pass
+    return OWNER_ID
+
 def control_ids():
     ids=set()
     if ADMIN_ID: ids.add(ADMIN_ID)
-    if OWNER_ID: ids.add(OWNER_ID)
+    oid=get_owner_id()
+    if oid: ids.add(oid)
     return ids
 
 def is_admin(uid): return bool(uid in control_ids())
-def is_owner(uid): return bool(OWNER_ID and uid==OWNER_ID)
+def is_owner(uid):
+    oid=get_owner_id()
+    return bool(oid and uid==oid)
 
 def add_user(u):
     with db() as c:
@@ -929,58 +943,67 @@ async def start(update,ctx):
     if gset("maintenance_mode","0")=="1" and not is_admin(u.id):
         return await update.message.reply_text("🛠 Bot is under maintenance.")
 
+    # Every /start must look brand new: drop whatever message we sent last
+    # time (force-join screen or main menu) before sending the fresh one.
+    # We no longer edit an old message in place, which is what made a
+    # repeat /start look like a stale "refresh" instead of a new post.
+    old_id=ctx.user_data.pop("last_start_message_id",None)
+    ctx.user_data.pop("force_join_message_id",None)
+    ctx.user_data.pop("force_join_message_photo",None)
+    if old_id:
+        try:
+            await ctx.bot.delete_message(chat_id=u.id,message_id=old_id)
+        except TelegramError:
+            pass
+
     rows=channels(False)
     if not rows or is_admin(u.id) or gset("force_join_enabled","1")!="1":
-        ctx.user_data.pop("force_join_message_id",None)
-        ctx.user_data.pop("force_join_message_photo",None)
         post=str(gset("postjoin","") or "").strip()
-        return await update.message.reply_text(post or " ",reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+        m=await update.message.reply_text(post or " ",reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+        if m and getattr(m,"message_id",None):
+            ctx.user_data["last_start_message_id"]=m.message_id
+        return
 
     verification=await verify_required_channels(ctx.bot,u.id,rows)
     has_pending_request=any(r.get("request_pending") for r in verification.get("results",[]))
     if verification["all_verified"] and not has_pending_request:
-        ctx.user_data.pop("force_join_message_id",None)
-        ctx.user_data.pop("force_join_message_photo",None)
         post=str(gset("postjoin","") or "").strip()
-        return await update.message.reply_text(post or " ",reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+        m=await update.message.reply_text(post or " ",reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+        if m and getattr(m,"message_id",None):
+            ctx.user_data["last_start_message_id"]=m.message_id
+        return
 
-    old_id=ctx.user_data.get("force_join_message_id")
-    if old_id:
-        try:
-            await render_force_join(
-                ctx.bot,u.id,u.id,rows=rows,verification=verification,
-                existing_message=SimpleNamespace(
-                    message_id=old_id,
-                    photo=bool(ctx.user_data.get("force_join_message_photo",False))
-                )
-            )
-            return
-        except TelegramError:
-            ctx.user_data.pop("force_join_message_id",None)
     try:
         m=await render_force_join(ctx.bot,u.id,u.id,rows=rows,verification=verification)
         if m and getattr(m,"message_id",None):
             ctx.user_data["force_join_message_id"]=m.message_id
             ctx.user_data["force_join_message_photo"]=bool(getattr(m,"photo",None))
+            ctx.user_data["last_start_message_id"]=m.message_id
     except TelegramError as e:
         logger.error("ForceJoin send failed user=%s: %s",u.id,e)
         # Ensure /start always produces a visible response even when the
         # configured image/caption fails unexpectedly.
         try:
             fallback_text=get_force_join_message() or "Join the required channel(s) and press Joined."
-            await ctx.bot.send_message(
+            m=await ctx.bot.send_message(
                 chat_id=u.id,
                 text=fallback_text,
                 reply_markup=join_kb(verification.get("remaining",[]), set(verification.get("joined",set()))),
                 parse_mode=ParseMode.HTML,
             )
+            if m and getattr(m,"message_id",None):
+                ctx.user_data["force_join_message_id"]=m.message_id
+                ctx.user_data["last_start_message_id"]=m.message_id
         except TelegramError:
             try:
-                await ctx.bot.send_message(
+                m=await ctx.bot.send_message(
                     chat_id=u.id,
                     text="Join the required channel(s) and press Joined.",
                     reply_markup=join_kb(verification.get("remaining",[]), set(verification.get("joined",set()))),
                 )
+                if m and getattr(m,"message_id",None):
+                    ctx.user_data["force_join_message_id"]=m.message_id
+                    ctx.user_data["last_start_message_id"]=m.message_id
             except TelegramError:
                 pass
 
@@ -999,12 +1022,15 @@ async def cb_check(update,ctx):
         try:
             if getattr(q.message,"photo",None):
                 await q.message.delete()
-                await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+                m=await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+                ctx.user_data["last_start_message_id"]=m.message_id
             else:
                 await q.edit_message_text(visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+                ctx.user_data["last_start_message_id"]=q.message.message_id
         except TelegramError:
             try:
-                await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+                m=await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+                ctx.user_data["last_start_message_id"]=m.message_id
             except TelegramError:
                 pass
         return
@@ -1015,6 +1041,7 @@ async def cb_check(update,ctx):
                                 verification=verification,existing_message=q.message)
         ctx.user_data["force_join_message_id"]=q.message.message_id
         ctx.user_data["force_join_message_photo"]=bool(getattr(q.message,"photo",None))
+        ctx.user_data["last_start_message_id"]=q.message.message_id
     except TelegramError as e:
         logger.warning("ForceJoin re-render failed user=%s: %s",uid,e)
 
@@ -1186,7 +1213,7 @@ def render_button_editor_text(key):
 def settings_kb():
     def t(k,n):
         on=gset(k,"0")=="1";return ib(("🟢 " if on else "🔴 ")+n+": "+("ON" if on else "OFF"),"a_toggle_"+k,style="success" if on else "danger",emoji_id=EMOJI["✅"] if on else EMOJI["❌"])
-    return safe_markup([[t("maintenance_mode","Maintenance Mode")],[t("force_join_enabled","Force Join")],[t("welcome_photo_enabled","Welcome Photo")],[t("broadcast_enabled","Broadcast")],[t("auto_backup_enabled","Auto Backup")],[t("debug_logging","Debug Logging")],[ib("🕒 Auto Backup: "+gset("auto_backup_frequency","daily"),"a_autobackup",style="primary",emoji_id=EMOJI["🔔"])],[back_button("a_back")]] )
+    return safe_markup([[t("maintenance_mode","Maintenance Mode")],[t("force_join_enabled","Force Join")],[t("welcome_photo_enabled","Welcome Photo")],[t("broadcast_enabled","Broadcast")],[t("auto_backup_enabled","Auto Backup")],[t("debug_logging","Debug Logging")],[ib("🕒 Auto Backup: "+gset("auto_backup_frequency","daily"),"a_autobackup",style="primary",emoji_id=EMOJI["🔔"])],[ib("👑 Owner ID: "+str(get_owner_id() or "Not set"),"a_set_ownerid",style="primary",emoji_id=EMOJI["👑"])],[back_button("a_back")]] )
 
 def health():
     up=int(time.monotonic()-STARTED_AT)
@@ -1550,6 +1577,23 @@ async def input_text(update,ctx,key,label,clear=False):
 async def s_top(u,c):return ConversationHandler.END if await input_text(u,c,"top","Top Message",True) else S_TOP
 async def s_welcome(u,c):return ConversationHandler.END if await input_text(u,c,"welcome","Welcome Message") else S_WELCOME
 async def s_postjoin(u,c):return ConversationHandler.END if await input_text(u,c,"postjoin","Post-Join Message") else S_POSTJOIN
+
+async def s_ownerid(u,c):
+    if not is_owner(u.effective_user.id):
+        await u.message.reply_text("❌ Only the current Owner can change this.",reply_markup=back_kb("a_settings"))
+        return ConversationHandler.END
+    if not u.message.text:return S_OWNERID
+    raw=u.message.text.strip()
+    if not raw.lstrip("-").isdigit():
+        await u.message.reply_text("⚠️ That's not a valid numeric Telegram ID. Send only digits, or /cancel.")
+        return S_OWNERID
+    new_id=int(raw)
+    sset("owner_id",str(new_id))
+    await u.message.reply_text(
+        f"✅ Owner ID updated to <code>{new_id}</code>.\n\n"
+        "That account now has full Owner access (/dkboss).",
+        reply_markup=back_kb("a_settings"),parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
 async def s_btn1(u,c):return ConversationHandler.END if await input_text(u,c,"btn1_msg","Button 1 Reply") else S_BTN1
 async def s_btn2(u,c):return ConversationHandler.END if await input_text(u,c,"btn2_msg","Button 2 Reply") else S_BTN2
 async def s_btn3(u,c):return ConversationHandler.END if await input_text(u,c,"btn3_msg","Button 3 Reply") else S_BTN3
@@ -2057,6 +2101,19 @@ async def admin_cb(update,ctx):
     if d.startswith("a_toggle_"):
         k=d[len("a_toggle_"):];sset(k,"0" if gset(k,"0")=="1" else "1");await q.edit_message_text("⚙️ Setting updated.",reply_markup=settings_kb());return ConversationHandler.END
     if d=="a_autobackup":sset("auto_backup_frequency","weekly" if gset("auto_backup_frequency","daily")=="daily" else "daily");await q.edit_message_text("⚙️ Auto backup schedule updated.",reply_markup=settings_kb());return ConversationHandler.END
+    if d=="a_set_ownerid":
+        # Changing the owner can lock everyone else out of /dkboss, so only
+        # the current owner is allowed to reassign it.
+        if not is_owner(q.from_user.id):
+            await q.answer("❌ Only the current Owner can change this.",show_alert=True)
+            return ConversationHandler.END
+        await q.edit_message_text(
+            "👑 <b>Set Owner ID</b>\n\n"
+            f"Current Owner ID: <code>{esc(get_owner_id() or 'Not set')}</code>\n\n"
+            "Send the new Telegram numeric user ID (ask the person to use "
+            "@userinfobot to get theirs).",
+            reply_markup=back_kb("a_settings"), parse_mode=ParseMode.HTML)
+        return S_OWNERID
     if d=="a_errors":
         with db() as c:rows=c.execute("SELECT created_at,level,message FROM error_logs ORDER BY id DESC LIMIT 20").fetchall()
         text="📜 <b>RECENT ERRORS</b>\n\n"+"\n".join(f"<code>{esc(r[0])}</code> · <b>{esc(r[1])}</b> · {esc(r[2])}" for r in rows) if rows else "📜 <b>RECENT ERRORS</b>\n\nNo errors."
@@ -2257,7 +2314,7 @@ def main():
         S_WELCOME:[MessageHandler(tf,s_welcome)],S_WELCOME_PHOTO:[MessageHandler((filters.PHOTO|filters.TEXT)&~filters.COMMAND,s_photo)],
         S_POSTJOIN:[MessageHandler(tf,s_postjoin)],S_TOP:[MessageHandler(tf,s_top)],S_BTN1:[MessageHandler(tf,s_btn1)],S_BTN2:[MessageHandler(tf,s_btn2)],S_BTN3:[MessageHandler(tf,s_btn3)],
         S_BCAST:[MessageHandler(bf,start_bcast)],S_BCAST_BTN_ASK:[CallbackQueryHandler(bcast_btn_ask,pattern=r"^bcast_btn_(yes|skip|cancel)$")],S_BCAST_BTN_LINK:[MessageHandler(tf,bcast_btn_link)],S_BCAST_BTN_NAME:[MessageHandler(tf,bcast_btn_name)],S_BCAST_BTN_STYLE:[CallbackQueryHandler(bcast_btn_style,pattern=r"^(bcast_style_|bcast_btn_cancel)")],S_BCAST_PREVIEW:[CallbackQueryHandler(bcast_preview,pattern=r"^bcast_(confirm|cancel)$")],S_RESTORE:[MessageHandler(rf,s_restore)],S_SEARCH:[MessageHandler(tf,s_search)],S_USERMSG:[MessageHandler(bf,s_usermsg)],
-        S_EDITNAME:[MessageHandler(tf,s_editname)],S_EDITLINK:[MessageHandler(tf,s_editlink)],S_EMOJI:[MessageHandler(tf,s_emoji)],S_BTN_NAME:[MessageHandler(tf,s_button_name)],S_BTN_NORMAL:[MessageHandler(tf,s_button_normal)],S_BTN_PREMIUM:[MessageHandler(tf,s_button_premium)],S_FORCE_JOIN_MSG:[MessageHandler(tf,s_force_join_message)]
+        S_EDITNAME:[MessageHandler(tf,s_editname)],S_EDITLINK:[MessageHandler(tf,s_editlink)],S_EMOJI:[MessageHandler(tf,s_emoji)],S_BTN_NAME:[MessageHandler(tf,s_button_name)],S_BTN_NORMAL:[MessageHandler(tf,s_button_normal)],S_BTN_PREMIUM:[MessageHandler(tf,s_button_premium)],S_FORCE_JOIN_MSG:[MessageHandler(tf,s_force_join_message)],S_OWNERID:[MessageHandler(tf,s_ownerid)]
       },fallbacks=[CommandHandler("cancel",cancel),CallbackQueryHandler(admin_cb,pattern=r"^a_")],per_chat=False,per_user=True,allow_reentry=True)
     app.add_handler(CommandHandler("start",start));app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(cb_check,pattern=r"^check_joined$"));app.add_handler(CallbackQueryHandler(cb_btn,pattern=r"^btn[123]$"));app.add_handler(CallbackQueryHandler(cb_back,pattern=r"^back_main$"))
@@ -2265,7 +2322,7 @@ def main():
     app.add_handler(ChatMemberHandler(chat_member_update,ChatMemberHandler.CHAT_MEMBER))
     app.add_error_handler(errors)
     start_render_health_server()
-    logger.info("Bot started: v%s / PTB %s / ADMIN_ID=%s / OWNER_ID=%s",BOT_VERSION,telegram.__version__,ADMIN_ID,OWNER_ID)
+    logger.info("Bot started: v%s / PTB %s / ADMIN_ID=%s / OWNER_ID=%s",BOT_VERSION,telegram.__version__,ADMIN_ID,get_owner_id())
     try:
         # Exactly one polling owner for this process. Telegram 409 conflicts are
         # handled by the registered error handler via Application.stop_running(),
